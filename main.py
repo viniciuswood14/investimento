@@ -13,61 +13,66 @@ TICKERS = [
     'CSAN3.SA', 'B3SA3.SA', 'BBSE3.SA', 'ELET3.SA', 'ABEV3.SA'
 ]
 
-def check_fundamentals(ticker_symbol):
-    """
-    Avalia a empresa e retorna uma tupla: (Status_Aprovacao, Motivo)
-    """
+def fetch_data(ticker_symbol):
+    """ Busca todos os dados necessários de uma vez para otimizar a API. """
     try:
         stock = yf.Ticker(ticker_symbol)
         info = stock.info
         
         pe_ratio = info.get('trailingPE', 0)
         roe = info.get('returnOnEquity', 0)
+        dy = info.get('dividendYield', 0)
         
-        # Checagem 1: Falta de dados na API
-        if pe_ratio is None or roe is None:
-            return False, "Dados financeiros ausentes na API."
-            
-        # Checagem 2: P/L Negativo (Prejuízo) ou Muito Alto (Cara demais)
+        # Tratamento para valores ausentes (yfinance costuma retornar None se for 0)
+        pe_ratio = float(pe_ratio) if pe_ratio else 0
+        roe = float(roe) if roe else 0
+        dy = float(dy) if dy else 0
+        
+        # Filtro de Qualidade (O Bouncer)
         if pe_ratio <= 0:
-            return False, f"Empresa dando prejuízo (P/L: {round(pe_ratio, 2)})."
+            return False, f"Prejuízo (P/L: {round(pe_ratio, 2)})", None
         if pe_ratio >= 30:
-            return False, f"Ação cara demais (P/L: {round(pe_ratio, 2)} > 30)."
-            
-        # Checagem 3: ROE Negativo ou Zero (Baixa eficiência)
+            return False, f"Muito cara (P/L: {round(pe_ratio, 2)} > 30)", None
         if roe <= 0:
-            return False, f"Retorno sobre Patrimônio negativo/zero (ROE: {round(roe*100, 2)}%)."
+            return False, f"ROE negativo/zero ({round(roe*100, 2)}%)", None
             
-        return True, "Aprovada"
+        dados_fundamentos = {
+            "pe": pe_ratio,
+            "roe": roe,
+            "dy": dy
+        }
+        return True, "Aprovada", dados_fundamentos
         
     except Exception as e:
-        return False, "Falha de conexão com a API do Yahoo Finance."
+        return False, "Falha na API ou falta de dados.", None
 
-def run_deep_research():
+def run_dual_strategy():
     try:
-        approved_tickers = []
+        approved_tickers = {}
         discarded_list = []
         
-        # Filtro de Qualidade e Registro de Reprovações
+        # 1. Coleta e Filtro de Fundamentos
         for ticker in TICKERS:
-            is_approved, reason = check_fundamentals(ticker)
+            is_approved, reason, fundamentals = fetch_data(ticker)
             if is_approved:
-                approved_tickers.append(ticker)
+                approved_tickers[ticker] = fundamentals
             else:
-                discarded_list.append({
-                    "ticker": ticker.replace('.SA', ''),
-                    "reason": reason
-                })
+                discarded_list.append({"ticker": ticker.replace('.SA', ''), "reason": reason})
                 
         if not approved_tickers:
-            return [], discarded_list
+            return [], [], discarded_list
             
-        # Baixa dados apenas das aprovadas
-        df = yf.download(approved_tickers, period="6mo", progress=False)['Close']
+        ativos_aprovados = list(approved_tickers.keys())
         
-        results = []
-        for ticker in approved_tickers:
+        # 2. Coleta de Preços para o Curto Prazo (Momentum/Volatilidade)
+        df = yf.download(ativos_aprovados, period="6mo", progress=False)['Close']
+        
+        resultados_curto_prazo = []
+        resultados_longo_prazo = []
+        
+        for ticker in ativos_aprovados:
             try:
+                # Dados Técnicos (Curto Prazo)
                 start_price = float(df[ticker].iloc[0])
                 end_price = float(df[ticker].iloc[-1])
                 momentum = (end_price / start_price) - 1
@@ -75,74 +80,120 @@ def run_deep_research():
                 daily_pct = df[ticker].pct_change()
                 volatility = float(daily_pct.std() * np.sqrt(252))
                 
-                score = momentum / volatility if volatility > 0 else 0
+                # Cálculo Curto Prazo (Sharpe: Retorno / Risco)
+                score_cp = momentum / volatility if volatility > 0 else 0
                 
-                results.append({
+                resultados_curto_prazo.append({
                     "ticker": ticker.replace('.SA', ''),
                     "price": round(end_price, 2),
                     "momentum": round(momentum * 100, 2),
                     "volatility": round(volatility * 100, 2),
-                    "score": round(score, 2)
+                    "score_cp": round(score_cp, 2)
                 })
+                
+                # Cálculo Longo Prazo (Value + Dividends: (ROE / P/L) + DY)
+                f = approved_tickers[ticker]
+                score_lp = (f['roe'] / f['pe']) + f['dy']
+                
+                resultados_longo_prazo.append({
+                    "ticker": ticker.replace('.SA', ''),
+                    "price": round(end_price, 2),
+                    "roe": round(f['roe'] * 100, 2),
+                    "pe": round(f['pe'], 2),
+                    "dy": round(f['dy'] * 100, 2),
+                    "score_lp": round(score_lp, 4)
+                })
+                
             except Exception:
                 continue
                 
-        ranking = pd.DataFrame(results).sort_values(by="score", ascending=False)
-        top_4 = ranking.head(4).to_dict(orient="records")
+        # 3. Ranqueamento Final
+        ranking_cp = pd.DataFrame(resultados_curto_prazo).sort_values(by="score_cp", ascending=False)
+        top_4_cp = ranking_cp.head(4).to_dict(orient="records")
         
-        return top_4, discarded_list
+        ranking_lp = pd.DataFrame(resultados_longo_prazo).sort_values(by="score_lp", ascending=False)
+        top_4_lp = ranking_lp.head(4).to_dict(orient="records")
+        
+        return top_4_cp, top_4_lp, discarded_list
         
     except Exception as e:
-        return [], [{"ticker": "ERRO GERAL", "reason": str(e)}]
+        print(f"Erro geral: {e}")
+        return [], [], [{"ticker": "ERRO", "reason": str(e)}]
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    top_4, discarded_list = run_deep_research()
+    top_4_cp, top_4_lp, discarded_list = run_dual_strategy()
     budget_per_stock = 2500
     
     html_content = f"""
     <html>
         <head>
-            <title>Sistema Alpha 20% (Blindado)</title>
+            <title>Alpha 20% & Hold</title>
             <style>
                 body {{ font-family: Arial, sans-serif; background: #121212; color: #e0e0e0; padding: 20px; }}
-                .container {{ max-width: 800px; margin: auto; }}
-                .card {{ background: #1e1e1e; padding: 15px 20px; margin: 10px 0; border-radius: 8px; border-left: 5px solid #00ff88; }}
-                h1, h2, h3 {{ color: #00ff88; }}
-                .price {{ color: #00ff88; font-weight: bold; font-size: 1.2em; }}
-                .tag {{ background: #333; padding: 5px 10px; border-radius: 4px; font-size: 0.9em; }}
-                .discard-table {{ width: 100%; border-collapse: collapse; margin-top: 20px; background: #1e1e1e; border-radius: 8px; overflow: hidden; }}
+                .container {{ max-width: 1000px; margin: auto; }}
+                .grid {{ display: flex; gap: 20px; }}
+                .col {{ flex: 1; }}
+                .card-cp {{ background: #1e1e1e; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 5px solid #00ff88; }}
+                .card-lp {{ background: #1e1e1e; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 5px solid #8800ff; }}
+                h1, h2 {{ text-align: center; }}
+                .title-cp {{ color: #00ff88; }}
+                .title-lp {{ color: #8800ff; }}
+                .price {{ font-weight: bold; font-size: 1.2em; }}
+                .price-cp {{ color: #00ff88; }}
+                .price-lp {{ color: #8800ff; }}
+                .tag {{ background: #333; padding: 5px 10px; border-radius: 4px; font-size: 0.85em; margin-right: 5px; }}
+                .discard-table {{ width: 100%; border-collapse: collapse; margin-top: 30px; background: #1e1e1e; border-radius: 8px; overflow: hidden; }}
                 .discard-table th, .discard-table td {{ padding: 12px; text-align: left; border-bottom: 1px solid #333; }}
                 .discard-table th {{ background: #2a2a2a; color: #ff4444; }}
-                .discard-table tr:last-child td {{ border-bottom: none; }}
                 .ticker-cell {{ font-weight: bold; color: #ffaa00; }}
             </style>
         </head>
         <body>
             <div class="container">
-                <h1>🛡️ Deep Research: Carteira Alpha Blindada</h1>
-                <p>Meta: 20% a.a. | Rebalanceamento Mensal</p>
-                <hr>
+                <h1 style="color: #fff;">📊 Sistema de Investimento Dual</h1>
+                <hr style="border-color: #333;">
                 
-                <h3>✅ Top 4 Ações (Aprovadas para Compra)</h3>
-                {''.join([f'''
-                <div class="card">
-                    <h2>{stock['ticker']}</h2>
-                    <p>Cotação: <span class="price">R$ {stock['price']}</span></p>
-                    <p>
-                        <span class="tag">Alta 6m: {stock['momentum']}%</span> 
-                        <span class="tag">Risco: {stock['volatility']}%</span>
-                    </p>
-                    <p>🎯 <strong>Comprar:</strong> {int(budget_per_stock / stock['price'])} ações (Usar Ticker: {stock['ticker']}F)</p>
+                <div class="grid">
+                    <div class="col">
+                        <h2 class="title-cp">⚡ Tática (Curto Prazo)</h2>
+                        <p style="text-align: center; font-size: 0.9em; color: #aaa;">Foco: Retorno 20% | Rebalanceamento Mensal</p>
+                        {''.join([f'''
+                        <div class="card-cp">
+                            <h3 style="margin-top: 0;">{stock['ticker']}</h3>
+                            <p>Cotação: <span class="price price-cp">R$ {stock['price']}</span></p>
+                            <p>
+                                <span class="tag">Momentum: {stock['momentum']}%</span> 
+                                <span class="tag">Risco: {stock['volatility']}%</span>
+                            </p>
+                            <p>🛒 Comprar: {int(budget_per_stock / stock['price'])} ações</p>
+                        </div>
+                        ''' for stock in top_4_cp])}
+                    </div>
+                    
+                    <div class="col">
+                        <h2 class="title-lp">🏦 Estrutural (Longo Prazo)</h2>
+                        <p style="text-align: center; font-size: 0.9em; color: #aaa;">Foco: Dividendos e Valor | Buy & Hold</p>
+                        {''.join([f'''
+                        <div class="card-lp">
+                            <h3 style="margin-top: 0;">{stock['ticker']}</h3>
+                            <p>Cotação: <span class="price price-lp">R$ {stock['price']}</span></p>
+                            <p>
+                                <span class="tag">P/L: {stock['pe']}</span> 
+                                <span class="tag">ROE: {stock['roe']}%</span>
+                                <span class="tag" style="background: #440088;">DY: {stock['dy']}%</span>
+                            </p>
+                            <p>🛒 Comprar para acumular</p>
+                        </div>
+                        ''' for stock in top_4_lp])}
+                    </div>
                 </div>
-                ''' for stock in top_4])}
                 
-                <br><br>
-                <h3>🚫 Lista de Corte (Ações Reprovadas)</h3>
+                <h3 style="color: #ff4444; margin-top: 40px;">🚫 Reprovadas no Filtro de Qualidade</h3>
                 <table class="discard-table">
                     <tr>
                         <th>Ativo</th>
-                        <th>Motivo da Reprovação no Filtro</th>
+                        <th>Motivo da Reprovação no Balanço</th>
                     </tr>
                     {''.join([f'''
                     <tr>
